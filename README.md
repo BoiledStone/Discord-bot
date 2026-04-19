@@ -12,7 +12,7 @@ SPOTIFY_CLIENT_SECRET=
 
 4.Install dependencies
 
-"python -m venv venv"
-"venv\Scripts\activate"
-"pip install -U pip"
-"pip install -U discord.py PyNaCl python-dotenv requests yt-dlp Pillow deezer-python davey"
+``python -m venv venv``
+``venv\Scripts\activate``
+``pip install -U pip``
+``pip install -U discord.py PyNaCl python-dotenv requests yt-dlp Pillow deezer-python davey``
