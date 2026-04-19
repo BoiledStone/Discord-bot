@@ -106,13 +106,13 @@ Note importante :
 Commande directe :
 
 ```bash
-python Renaudbot4.py
+python discordbot.py
 ```
 
 Si tu utilises l'environnement virtuel :
 
 ```bash
-venv\Scripts\python.exe Renaudbot4.py
+venv\Scripts\python.exe discordbot.py
 ```
 
 ## 7. Commandes principales
