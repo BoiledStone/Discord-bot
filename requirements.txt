@@ -1,0 +1,7 @@
+discord.py
+PyNaCl
+python-dotenv
+requests
+yt-dlp
+Pillow
+deezer-python
