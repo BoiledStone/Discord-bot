@@ -1,6 +1,10 @@
-﻿import asyncio
+import asyncio
 import base64
+from collections import deque
+from contextlib import suppress
+from functools import lru_cache
 import html
+from importlib import metadata as importlib_metadata
 from io import BytesIO
 import json
 import logging
@@ -44,17 +48,41 @@ load_dotenv()
 
 TOKEN = os.getenv("TOKEN")
 PREFIX = "r!"
+IDLE_LISTENING_STATUS = "r!help | r!play [lien ou recherche]"
 IS_WINDOWS = os.name == "nt"
+IS_LINUX = not IS_WINDOWS
+_host_name_probe = (os.getenv("HOSTNAME") or os.getenv("COMPUTERNAME") or socket.gethostname() or "").lower()
+IS_STEAMDECK = IS_LINUX and (
+    "steamdeck" in _host_name_probe
+    or os.getenv("USER", "").strip().lower() == "deck"
+    or os.path.isdir("/home/deck")
+)
 USE_ENV_PROXY = os.getenv("BOT_USE_ENV_PROXY", "").strip().lower() in {"1", "true", "yes", "on"}
+YTDLP_COOKIES_BROWSER = os.getenv("BOT_YTDLP_COOKIES_BROWSER", "").strip().lower()
+YTDLP_SOURCE_ADDRESS = os.getenv("BOT_YTDLP_SOURCE_ADDRESS", "").strip()
+# Keep PCM re-encoding as the default path.
+# Direct Opus passthrough is faster, but it is more brittle when Discord voice
+# transport details change and can manifest as "speaking" without audible sound.
+ALLOW_OPUS_PASSTHROUGH = os.getenv("BOT_ALLOW_OPUS_PASSTHROUGH", "").strip().lower() in {"1", "true", "yes", "on"}
 AUTO_DISCONNECT_SECONDS = 180
-VOICE_READY_WAIT_SECONDS = 4.0
-VOICE_READY_POLL_SECONDS = 0.2
+VOICE_READY_WAIT_SECONDS = 6.5 if IS_STEAMDECK else (5.0 if IS_LINUX else 4.0)
+VOICE_READY_POLL_SECONDS = 0.25 if IS_STEAMDECK else 0.2
+VOICE_AUDIO_READY_WAIT_SECONDS = 10.0 if IS_STEAMDECK else (8.0 if IS_LINUX else 6.0)
+VOICE_AUDIO_READY_POLL_SECONDS = 0.15 if IS_STEAMDECK else 0.1
+VOICE_CONNECT_TIMEOUT_SECONDS = 30 if IS_STEAMDECK else (24 if IS_LINUX else 20)
+VOICE_CONNECT_RETRIES = 4 if IS_STEAMDECK else (3 if IS_LINUX else 2)
+VOICE_CONNECT_RETRY_DELAY_SECONDS = 1.2 if IS_STEAMDECK else (1.0 if IS_LINUX else 0.8)
+VOICE_RECONNECT_GRACE_SECONDS = 3.2 if IS_STEAMDECK else 2.0
+VOICE_RECOVERY_DELAY_SECONDS = 1.6 if IS_STEAMDECK else 1.2
+VOICE_RECOVERY_MAX_ATTEMPTS = 16 if IS_STEAMDECK else 10
+try:
+    AUDIO_PREBUFFER_FRAMES = max(0, int(os.getenv("BOT_AUDIO_PREBUFFER_FRAMES", "8")))
+except Exception:
+    AUDIO_PREBUFFER_FRAMES = 8
+STREAM_URL_REFRESH_MARGIN_SECONDS = 300
 QUEUE_PREVIEW_LIMIT = 10
 QUEUE_COMPACT_THRESHOLD = 12
-
-if not TOKEN:
-    raise ValueError("❌ Aucun TOKEN trouvé dans .env !")
-
+QUEUE_EMBED_TITLE = "📜 File d'attente"
 
 def sanitize_linux_preload():
     if IS_WINDOWS:
@@ -80,6 +108,93 @@ def sanitize_linux_preload():
 
 sanitize_linux_preload()
 
+
+OPUS_LIBRARY_PATH = None
+
+
+def ensure_discord_opus_loaded():
+    global OPUS_LIBRARY_PATH
+
+    try:
+        if discord.opus.is_loaded():
+            OPUS_LIBRARY_PATH = getattr(discord.opus, "_lib", None)
+            return True
+    except Exception:
+        return False
+
+    if IS_WINDOWS:
+        discord_bin = os.path.join(os.path.dirname(discord.__file__), "bin")
+        candidates = [
+            os.path.join(os.getcwd(), "bin", "opus.dll"),
+            os.path.join(os.getcwd(), "bin", "libopus-0.x64.dll"),
+            os.path.join(discord_bin, "libopus-0.x64.dll"),
+            os.path.join(discord_bin, "libopus-0.x86.dll"),
+            "libopus-0.x64.dll",
+            "opus.dll",
+        ]
+    else:
+        candidates = [
+            "libopus.so.0",
+            "libopus.so",
+            "/usr/lib/libopus.so.0",
+            "/usr/lib64/libopus.so.0",
+            "/usr/lib/x86_64-linux-gnu/libopus.so.0",
+            "/app/lib/libopus.so.0",
+            "/home/deck/.local/lib/libopus.so.0",
+        ]
+
+    seen = set()
+    for candidate in candidates:
+        normalized_candidate = os.path.normcase(os.path.abspath(candidate)) if os.path.isabs(candidate) else candidate.lower()
+        if normalized_candidate in seen:
+            continue
+        seen.add(normalized_candidate)
+
+        if os.path.isabs(candidate) and not os.path.isfile(candidate):
+            continue
+
+        try:
+            discord.opus.load_opus(candidate)
+            if discord.opus.is_loaded():
+                OPUS_LIBRARY_PATH = candidate
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
+OPUS_LOADED = ensure_discord_opus_loaded()
+
+
+def detect_discord_dave_support():
+    try:
+        from discord.voice_state import has_dave  # type: ignore
+        return bool(has_dave)
+    except Exception:
+        return False
+
+
+DAVE_LOADED = detect_discord_dave_support()
+
+
+def detect_discord_package_conflict():
+    versions = {}
+
+    for package_name in ("discord.py", "py-cord"):
+        try:
+            versions[package_name] = importlib_metadata.version(package_name)
+        except importlib_metadata.PackageNotFoundError:  # noqa: PERF203
+            continue
+        except Exception:
+            continue
+
+    has_conflict = "discord.py" in versions and "py-cord" in versions
+    return has_conflict, versions
+
+
+HAS_DISCORD_PACKAGE_CONFLICT, DISCORD_PACKAGE_VERSIONS = detect_discord_package_conflict()
+
 class QuietYTDLLogger:
     def debug(self, msg):
         pass
@@ -104,30 +219,65 @@ bot.remove_command("help")
 logging.getLogger("discord.player").setLevel(logging.WARNING)
 
 
+YOUTUBE_YTDL_PLAYER_CLIENTS = ("default", "web_safari", "android_vr", "ios", "mweb")
+
+
+@bot.check
+async def ensure_guild_context(ctx):
+    if ctx.guild is None:
+        raise commands.NoPrivateMessage("Ce bot fonctionne uniquement dans un serveur Discord.")
+    return True
+
+
 ytdl_format_options = {
     "format": "bestaudio[protocol^=http][abr<=256]/bestaudio[protocol^=http]/bestaudio/best",
     "noplaylist": True,
     "quiet": True,
     "default_search": "auto",
-    "source_address": "0.0.0.0",
     "geo_bypass": True,
     "ignoreerrors": True,
     "extractor_args": {
-        "youtube": ["player_client=default"],
+        "youtube": {"player_client": list(YOUTUBE_YTDL_PLAYER_CLIENTS)},
     },
     "logger": QuietYTDLLogger(),
 }
 if not USE_ENV_PROXY:
     ytdl_format_options["proxy"] = ""
+if YTDLP_COOKIES_BROWSER:
+    ytdl_format_options["cookiesfrombrowser"] = (YTDLP_COOKIES_BROWSER,)
+if YTDLP_SOURCE_ADDRESS:
+    ytdl_format_options["source_address"] = YTDLP_SOURCE_ADDRESS
 
-ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
+YOUTUBE_YTDL_FALLBACK_CLIENTS = (
+    ("web_safari",),
+    ("android_vr",),
+    ("ios",),
+    ("mweb",),
+)
+
+
+def ytdl_options_for_clients(base_options, player_clients):
+    options = dict(base_options)
+    options["extractor_args"] = {"youtube": {"player_client": list(player_clients)}}
+    return options
+
+
+ytdl = youtube_dl.YoutubeDL(dict(ytdl_format_options))
+ytdl_fallbacks = [
+    youtube_dl.YoutubeDL(ytdl_options_for_clients(ytdl_format_options, clients))
+    for clients in YOUTUBE_YTDL_FALLBACK_CLIENTS
+]
 ytdl_search_format_options = dict(ytdl_format_options)
 ytdl_search_format_options["extract_flat"] = True
-ytdl_search = youtube_dl.YoutubeDL(ytdl_search_format_options)
+ytdl_search = youtube_dl.YoutubeDL(dict(ytdl_search_format_options))
+ytdl_search_fallbacks = [
+    youtube_dl.YoutubeDL(ytdl_options_for_clients(ytdl_search_format_options, clients))
+    for clients in YOUTUBE_YTDL_FALLBACK_CLIENTS
+]
 ytdl_playlist_format_options = dict(ytdl_format_options)
 ytdl_playlist_format_options["noplaylist"] = False
 ytdl_playlist_format_options["extract_flat"] = "in_playlist"
-ytdl_playlist = youtube_dl.YoutubeDL(ytdl_playlist_format_options)
+ytdl_playlist = youtube_dl.YoutubeDL(dict(ytdl_playlist_format_options))
 thumbnail_color_cache = {}
 _http_session_local = threading.local()
 spotify_tracks_cache = {}
@@ -159,17 +309,46 @@ INSTANCE_FEEDBACK_JITTER_SECONDS = (
 instance_lock_handle = None
 USE_DYNAMIC_EMBED_COLORS = True
 MAX_ENRICHED_CANDIDATES = 1
-YOUTUBE_PRIMARY_SEARCH_SIZE = 2
-YOUTUBE_FALLBACK_SEARCH_SIZE = 1
+YOUTUBE_PRIMARY_SEARCH_SIZE = 3
+YOUTUBE_FALLBACK_SEARCH_SIZE = 2
 YOUTUBE_EARLY_ACCEPT_SCORE = 145
 YOUTUBE_EARLY_ACCEPT_MARGIN = 16
 PREFERRED_AUDIO_ABR = 224
-MATCHING_ALGO_VERSION = 7
+MATCHING_ALGO_VERSION = 5
 STRICT_FAST_ACCEPT_SCORE = 160
-STRICT_SLOW_SEARCH_SIZE = 2
+STRICT_SLOW_SEARCH_SIZE = 3
+CACHE_MAX_ENTRIES = 4096
+THUMBNAIL_COLOR_CACHE_MAX_ENTRIES = 2048
+
+
+def extract_info_with_fallbacks(candidate, *, search=None):
+    candidate_text = str(candidate or "").strip()
+    if not candidate_text:
+        return None
+
+    if search is None:
+        search = candidate_text.lower().startswith("ytsearch")
+
+    extractors = [ytdl_search, *ytdl_search_fallbacks] if search else [ytdl, *ytdl_fallbacks]
+    last_error = None
+    for extractor in extractors:
+        try:
+            data = extractor.extract_info(candidate_text, download=False)
+        except Exception as exc:
+            last_error = exc
+            continue
+        if data:
+            return data
+
+    if last_error is not None:
+        raise last_error
+    return None
 FFMPEG_STREAM_BEFORE_OPTIONS = (
     "-nostdin "
-    "-thread_queue_size 8192 "
+    f"-thread_queue_size {16384 if IS_STEAMDECK else 8192} "
+    "-fflags +genpts "
+    "-probesize 1048576 "
+    "-analyzeduration 3000000 "
     "-reconnect 1 "
     "-reconnect_streamed 1 "
     "-reconnect_on_network_error 1 "
@@ -178,44 +357,36 @@ FFMPEG_STREAM_BEFORE_OPTIONS = (
     "-rw_timeout 20000000"
 )
 FFMPEG_STREAM_OPTIONS = "-vn -sn -dn -loglevel quiet"
+FFMPEG_PCM_RESAMPLE_FILTER = "aresample=async=1000:first_pts=0"
+FFMPEG_PCM_STREAM_OPTIONS = f"-vn -sn -dn -af {FFMPEG_PCM_RESAMPLE_FILTER} -loglevel quiet"
 FFMPEG_SOUNDCLOUD_STREAM_OPTIONS = (
     "-vn -sn -dn "
-    "-af aresample=48000:first_pts=0 "
+    f"-af {FFMPEG_PCM_RESAMPLE_FILTER} "
     "-loglevel quiet"
 )
-_ffmpeg_executable = None
 
 
+@lru_cache(maxsize=1)
 def find_ffmpeg():
-    global _ffmpeg_executable
-
-    if _ffmpeg_executable:
-        return _ffmpeg_executable
-
     local_candidates = []
     if IS_WINDOWS:
         local_candidates.append(os.path.join(os.getcwd(), "bin", "ffmpeg.exe"))
-        local_candidates.append(r"C:\ffmpeg\bin\ffmpeg.exe")
     else:
         local_candidates.append(os.path.join(os.getcwd(), "bin", "ffmpeg"))
         local_candidates.append(os.path.join(os.getcwd(), "bin", "ffmpeg.exe"))
-        local_candidates.extend([
-            "/usr/bin/ffmpeg",
-            "/usr/local/bin/ffmpeg",
-        ])
+        local_candidates.append("/usr/bin/ffmpeg")
+        local_candidates.append("/usr/local/bin/ffmpeg")
+        local_candidates.append("/app/bin/ffmpeg")
+        local_candidates.append("/home/deck/.local/bin/ffmpeg")
 
     for local_path in local_candidates:
         if os.path.isfile(local_path):
-            _ffmpeg_executable = local_path
-            return _ffmpeg_executable
+            return local_path
 
-    discovered = shutil.which("ffmpeg.exe" if IS_WINDOWS else "ffmpeg")
+    discovered = shutil.which("ffmpeg")
     if discovered:
-        _ffmpeg_executable = discovered
-        return _ffmpeg_executable
-
-    _ffmpeg_executable = "ffmpeg"
-    return _ffmpeg_executable
+        return discovered
+    return "ffmpeg"
 
 
 def resolve_local_asset(*names):
@@ -243,7 +414,7 @@ def format_duration(seconds):
     if seconds is None:
         return "?"
     try:
-        total = int(round(float(seconds)))
+        total = round(float(seconds))
         return f"{total // 60}:{total % 60:02d}"
     except Exception:
         return "?"
@@ -251,7 +422,7 @@ def format_duration(seconds):
 
 def format_timecode(seconds):
     try:
-        total = max(0, int(round(float(seconds))))
+        total = max(0, round(float(seconds)))
     except Exception:
         return "0:00"
 
@@ -261,6 +432,23 @@ def format_timecode(seconds):
     if hours:
         return f"{hours}:{minutes:02d}:{remaining_seconds:02d}"
     return f"{minutes}:{remaining_seconds:02d}"
+
+
+def format_current_timecode(player):
+    if player is None or not isinstance(getattr(player, "current", None), dict):
+        return None
+
+    elapsed = player.playback_elapsed_seconds()
+    if elapsed is None:
+        seek_position = player.current.get("_seek_position")
+        elapsed = seek_position if isinstance(seek_position, (int, float)) else 0
+
+    duration = player.track_duration_seconds(player.current)
+    if isinstance(duration, (int, float)) and duration > 0:
+        elapsed = min(float(elapsed), float(duration))
+        return f"{format_timecode(elapsed)} / {format_timecode(duration)}"
+
+    return format_timecode(elapsed)
 
 
 def parse_timecode(value):
@@ -312,9 +500,7 @@ def image_request_headers(url=None):
         "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
     }
     host = (urlparse(url).netloc or "").lower() if url else ""
-    if "ytimg.com" in host:
-        headers["Referer"] = "https://www.youtube.com/"
-    elif "googleusercontent.com" in host or "ggpht.com" in host:
+    if "ytimg.com" in host or "googleusercontent.com" in host or "ggpht.com" in host:
         headers["Referer"] = "https://www.youtube.com/"
     elif "scdn.co" in host:
         headers["Referer"] = "https://open.spotify.com/"
@@ -334,7 +520,7 @@ def http_session():
 
 def acquire_instance_lock():
     lock_path = os.path.join(os.getcwd(), ".renaud_bot.instance.lock")
-    lock_file = open(lock_path, "a+b")
+    lock_file = open(lock_path, "a+b")  # noqa: SIM115 - keep handle open to hold the instance lock.
     try:
         if os.name == "nt":
             import msvcrt
@@ -347,12 +533,10 @@ def acquire_instance_lock():
         else:
             import fcntl
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except Exception:
-        try:
+    except Exception as exc:
+        with suppress(Exception):
             lock_file.close()
-        except Exception:
-            pass
-        raise RuntimeError("Une autre instance du bot est déjà en cours sur cette machine.")
+        raise RuntimeError("Une autre instance du bot est déjà en cours sur cette machine.") from exc
 
     try:
         lock_file.seek(0)
@@ -362,6 +546,44 @@ def acquire_instance_lock():
     except Exception:
         pass
     return lock_file
+
+
+def release_instance_lock(lock_handle):
+    if lock_handle is None:
+        return
+    with suppress(Exception):
+        lock_handle.close()
+
+
+def prune_ttl_cache(cache, *, max_entries=CACHE_MAX_ENTRIES):
+    if len(cache) <= max_entries:
+        return
+
+    now = time.monotonic()
+    for cache_key, cached_value in list(cache.items()):
+        if len(cache) <= max_entries:
+            return
+        if not isinstance(cached_value, tuple) or len(cached_value) != 2:
+            continue
+        expires_at, _ = cached_value
+        if isinstance(expires_at, (int, float)) and expires_at <= now:
+            cache.pop(cache_key, None)
+
+    if len(cache) <= max_entries:
+        return
+
+    overflow = len(cache) - max_entries
+    for cache_key in list(cache.keys())[:overflow]:
+        cache.pop(cache_key, None)
+
+
+def prune_plain_cache(cache, *, max_entries):
+    if len(cache) <= max_entries:
+        return
+
+    overflow = len(cache) - max_entries
+    for cache_key in list(cache.keys())[:overflow]:
+        cache.pop(cache_key, None)
 
 
 def get_cached(cache, key):
@@ -378,6 +600,7 @@ def get_cached(cache, key):
 
 def set_cached(cache, key, value, ttl_seconds):
     cache[key] = (time.monotonic() + ttl_seconds, value)
+    prune_ttl_cache(cache)
 
 
 def clone_tracks(tracks):
@@ -494,9 +717,7 @@ def build_compact_tracklist_chunks(tracks, *, max_chunk_length=950, max_total_le
             truncate_display_text(display_artist, 20 if is_youtube_track else 42)
         ) if display_artist else ""
 
-        if not artist:
-            line = f"`{index:02d}.` **{title}**"
-        elif is_youtube_track and len(f"{display_title} {display_artist}") > 44:
+        if not artist or (is_youtube_track and len(f"{display_title} {display_artist}") > 44):
             line = f"`{index:02d}.` **{title}**"
         else:
             line = f"`{index:02d}.` **{title}** • {artist}"
@@ -526,16 +747,50 @@ def build_compact_tracklist_chunks(tracks, *, max_chunk_length=950, max_total_le
     return chunks, remaining_count
 
 
-async def wait_for_voice_client(guild, *, timeout=VOICE_READY_WAIT_SECONDS, poll_interval=VOICE_READY_POLL_SECONDS):
+def voice_dave_status(voice_client):
+    connection_state = getattr(voice_client, "_connection", None)
+    if connection_state is None:
+        return 0, True
+
+    try:
+        protocol_version = int(getattr(connection_state, "dave_protocol_version", 0) or 0)
+    except Exception:
+        protocol_version = 0
+
+    try:
+        can_encrypt = bool(getattr(connection_state, "can_encrypt", False))
+    except Exception:
+        can_encrypt = protocol_version <= 0
+
+    return protocol_version, can_encrypt
+
+
+async def wait_for_voice_client(
+    guild,
+    *,
+    timeout=VOICE_READY_WAIT_SECONDS,
+    poll_interval=VOICE_READY_POLL_SECONDS,
+    require_audio_ready=False,
+):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         voice_client = guild.voice_client
         if voice_client and voice_client.is_connected():
-            return voice_client
+            if not require_audio_ready:
+                return voice_client
+
+            dave_protocol_version, can_encrypt = voice_dave_status(voice_client)
+            if dave_protocol_version <= 0 or can_encrypt:
+                return voice_client
         await asyncio.sleep(poll_interval)
     voice_client = guild.voice_client
     if voice_client and voice_client.is_connected():
-        return voice_client
+        if not require_audio_ready:
+            return voice_client
+
+        dave_protocol_version, can_encrypt = voice_dave_status(voice_client)
+        if dave_protocol_version <= 0 or can_encrypt:
+            return voice_client
     return None
 
 
@@ -571,6 +826,19 @@ def command_feedback_key(ctx, base):
 def guild_feedback_key(ctx, base):
     guild_id = getattr(getattr(ctx, "guild", None), "id", 0)
     return f"{base}:{int(guild_id)}"
+
+
+def command_usage(command):
+    if not command:
+        return None
+
+    command_name = str(getattr(command, "qualified_name", "") or "").strip()
+    if not command_name:
+        return None
+
+    signature = str(getattr(command, "signature", "") or "").strip()
+    suffix = f" {signature}" if signature else ""
+    return f"`{PREFIX}{command_name}{suffix}`"
 
 
 async def send_unique_feedback(ctx, content, *, key=None, window=FEEDBACK_DEDUPE_WINDOW_SECONDS):
@@ -745,7 +1013,7 @@ def schedule_message_embed_suppression(message, *, attempts=12, delay=0.7):
 
 
 async def fetch_text(url, *, headers=None, timeout=20):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _do():
         session = http_session()
@@ -757,7 +1025,7 @@ async def fetch_text(url, *, headers=None, timeout=20):
 
 
 async def fetch_json(url, *, headers=None, timeout=20):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _do():
         session = http_session()
@@ -1236,7 +1504,7 @@ async def get_thumbnail_color(url, fallback):
         if candidate in thumbnail_color_cache:
             return thumbnail_color_cache[candidate]
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _do(candidate):
         session = http_session()
@@ -1255,7 +1523,7 @@ async def get_thumbnail_color(url, fallback):
                 color = extract_image_color(response.content)
                 if color is not None:
                     return color
-            except Exception as exc:
+            except Exception as exc:  # noqa: PERF203
                 last_error = exc
                 continue
 
@@ -1287,6 +1555,7 @@ async def get_thumbnail_color(url, fallback):
 
         for cache_candidate in urls:
             thumbnail_color_cache[cache_candidate] = color
+        prune_plain_cache(thumbnail_color_cache, max_entries=THUMBNAIL_COLOR_CACHE_MAX_ENTRIES)
         return color
 
     # Do not permanently cache fallback values when image fetch fails.
@@ -1361,7 +1630,7 @@ async def build_now_playing_card_file(
     if not thumbnail_url or Image is None or ImageDraw is None or ImageFont is None:
         return None
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _do():
         session = http_session()
@@ -1454,7 +1723,7 @@ async def build_now_playing_card_visual(
     if not thumbnail_url or Image is None or ImageDraw is None or ImageFont is None:
         return None
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _do():
         session = http_session()
@@ -2261,10 +2530,7 @@ async def deezer_to_tracks(url: str):
             or fallback_thumb
         )
         duration = track_obj.get("duration")
-        if isinstance(duration, (int, float)):
-            duration = int(duration)
-        else:
-            duration = None
+        duration = int(duration) if isinstance(duration, (int, float)) else None
         return {
             "query": f'"{artist_name}" "{title}" audio',
             "title": title,
@@ -2281,8 +2547,8 @@ async def deezer_to_tracks(url: str):
         if not item_type or not item_id:
             # Fallback: let yt-dlp parse deezer pages/redirects when short-link parsing fails.
             try:
-                loop = asyncio.get_event_loop()
-                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
+                loop = asyncio.get_running_loop()
+                data = await loop.run_in_executor(None, lambda: extract_info_with_fallbacks(url, search=False))
                 if isinstance(data, dict) and data.get("entries"):
                     data = next((entry for entry in data.get("entries", []) if entry), None)
                 if isinstance(data, dict):
@@ -2320,15 +2586,17 @@ async def deezer_to_tracks(url: str):
             elif item_type == "album":
                 album = dz.get_album(item_id)
                 if album:
-                    for track in album.tracks:
-                        results.append({
+                    results.extend(
+                        {
                             "query": f'"{track.artist.name}" "{track.title}" audio',
                             "title": track.title,
                             "artist": track.artist.name,
                             "thumbnail": album.cover_medium,
                             "duration": track.duration,
                             "source": "deezer",
-                        })
+                        }
+                        for track in album.tracks
+                    )
                     attach_collection_to_tracks(
                         results,
                         {
@@ -2344,15 +2612,17 @@ async def deezer_to_tracks(url: str):
             elif item_type == "playlist":
                 playlist = dz.get_playlist(item_id)
                 if playlist:
-                    for track in playlist.tracks:
-                        results.append({
+                    results.extend(
+                        {
                             "query": f'"{track.artist.name}" "{track.title}" audio',
                             "title": track.title,
                             "artist": track.artist.name,
                             "thumbnail": track.album.cover_medium,
                             "duration": track.duration,
                             "source": "deezer",
-                        })
+                        }
+                        for track in playlist.tracks
+                    )
                     attach_collection_to_tracks(
                         results,
                         {
@@ -2390,7 +2660,7 @@ async def deezer_to_tracks(url: str):
                             "kind": "album",
                             "label": "Album",
                             "title": clean_spotify_text(album_data.get("title")) if isinstance(album_data, dict) else "Album Deezer",
-                            "subtitle": clean_spotify_text(((album_data.get("artist") or {}).get("name"))) if isinstance(album_data, dict) else None,
+                            "subtitle": clean_spotify_text((album_data.get("artist") or {}).get("name")) if isinstance(album_data, dict) else None,
                             "thumbnail": album_thumb,
                             "source": "deezer",
                             "count": int(album_data.get("nb_tracks") or len(results)) if isinstance(album_data, dict) else len(results),
@@ -2422,25 +2692,23 @@ async def deezer_to_tracks(url: str):
                         },
                     )
     except Exception as exc:
-        raise RuntimeError(f"Erreur Deezer : {exc}")
+        raise RuntimeError(f"Erreur Deezer : {exc}") from exc
     set_cached(deezer_tracks_cache, cache_key, clone_tracks(results), TRACK_CACHE_TTL_SECONDS)
     return results
 
 
 async def bandcamp_to_tracks(url: str):
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
-        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
+        data = await loop.run_in_executor(None, lambda: extract_info_with_fallbacks(url, search=False))
     except Exception as exc:
-        raise RuntimeError(f"Erreur Bandcamp : {exc}")
+        raise RuntimeError(f"Erreur Bandcamp : {exc}") from exc
 
     def normalize_entry(entry):
         duration = entry.get("duration")
         if duration is not None:
-            try:
-                duration = int(round(duration))
-            except Exception:
-                pass
+            with suppress(Exception):
+                duration = round(float(duration))
         return {
             "url": entry.get("webpage_url") or entry.get("url"),
             "title": entry.get("title"),
@@ -2483,10 +2751,7 @@ def normalize_youtube_playlist_entry(entry, *, fallback_thumbnail=None):
     artist = clean_playlist_display_artist(entry.get("channel") or entry.get("uploader"), source="youtube")
     thumbnail = youtube_playlist_thumbnail(entry) or fallback_thumbnail
     duration = entry.get("duration")
-    if isinstance(duration, (int, float)):
-        duration = int(duration)
-    else:
-        duration = None
+    duration = int(duration) if isinstance(duration, (int, float)) else None
 
     return {
         "url": webpage_url,
@@ -2508,11 +2773,11 @@ async def youtube_playlist_to_tracks(url: str):
     if cached_tracks is not None:
         return clone_tracks(cached_tracks)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         data = await loop.run_in_executor(None, lambda: ytdl_playlist.extract_info(url, download=False))
     except Exception as exc:
-        raise RuntimeError(f"Erreur YouTube playlist : {exc}")
+        raise RuntimeError(f"Erreur YouTube playlist : {exc}") from exc
 
     if not isinstance(data, dict):
         raise RuntimeError("Impossible de lire la playlist YouTube.")
@@ -2798,10 +3063,7 @@ def pick_best_entry(data, *, title=None, artist=None, duration=None, query_text=
 
 def build_track_cache_key(track):
     duration = track.get("duration")
-    if isinstance(duration, (int, float)):
-        duration = int(round(duration))
-    else:
-        duration = None
+    duration = round(duration) if isinstance(duration, (int, float)) else None
 
     return (
         MATCHING_ALGO_VERSION,
@@ -2815,6 +3077,74 @@ def build_track_cache_key(track):
 
 def build_ytsearch_query(query_text, limit):
     return f"ytsearch{limit}:{query_text}"
+
+
+def stream_url_expiry_timestamp(url):
+    if not isinstance(url, str) or not url.strip():
+        return None
+    try:
+        expires = parse_qs(urlparse(url).query).get("expire")
+    except Exception:
+        return None
+    if not expires:
+        return None
+    try:
+        return int(float(expires[0]))
+    except Exception:
+        return None
+
+
+def stream_url_is_fresh(url, *, margin_seconds=STREAM_URL_REFRESH_MARGIN_SECONDS):
+    expiry_timestamp = stream_url_expiry_timestamp(url)
+    if expiry_timestamp is None:
+        return True
+    return (expiry_timestamp - time.time()) > max(0, int(margin_seconds))
+
+
+def playback_data_stream_urls(data):
+    if not isinstance(data, dict):
+        return []
+
+    urls = []
+
+    def add(url):
+        if isinstance(url, str) and url.strip() and url not in urls:
+            urls.append(url)
+
+    add(data.get("_selected_audio_url"))
+    selected_format = data.get("_selected_audio_format")
+    if isinstance(selected_format, dict):
+        add(selected_format.get("url"))
+    add(data.get("url"))
+    for fmt in data.get("formats") or []:
+        if isinstance(fmt, dict):
+            add(fmt.get("url"))
+    return urls
+
+
+def playback_data_is_fresh(data):
+    urls = playback_data_stream_urls(data)
+    return bool(urls) and all(stream_url_is_fresh(url) for url in urls)
+
+
+def prefer_stable_http_audio(data):
+    extractor_name = str(data.get("extractor_key") or data.get("extractor") or "").lower()
+    webpage_url = str(data.get("webpage_url") or data.get("original_url") or "").lower()
+    return "soundcloud" in extractor_name or "soundcloud.com" in webpage_url or "snd.sc" in webpage_url
+
+
+def rank_audio_formats(data):
+    formats = data.get("formats") or []
+    prefer_stable_http = prefer_stable_http_audio(data)
+    candidates = [fmt for fmt in formats if fmt.get("acodec") not in {None, "none"} and fmt.get("url")]
+    return sorted(
+        [
+            (score_audio_format(fmt, prefer_stable_http=prefer_stable_http), fmt)
+            for fmt in candidates
+        ],
+        key=lambda item: item[0],
+        reverse=True,
+    )
 
 
 def score_audio_format(fmt, *, prefer_stable_http=False):
@@ -2882,25 +3212,16 @@ def score_audio_format(fmt, *, prefer_stable_http=False):
 
 
 def select_audio_url(data):
-    formats = data.get("formats") or []
-    extractor_name = str(data.get("extractor_key") or data.get("extractor") or "").lower()
-    webpage_url = str(data.get("webpage_url") or data.get("original_url") or "").lower()
-    prefer_stable_http = "soundcloud" in extractor_name or "soundcloud.com" in webpage_url or "snd.sc" in webpage_url
-    candidates = [fmt for fmt in formats if fmt.get("acodec") != "none" and fmt.get("url")]
-    if candidates:
-        best_format = max(candidates, key=lambda fmt: score_audio_format(fmt, prefer_stable_http=prefer_stable_http))
-        return best_format.get("url")
+    ranked_formats = rank_audio_formats(data)
+    if ranked_formats:
+        return ranked_formats[0][1].get("url")
     return data.get("url")
 
 
 def select_audio_format(data):
-    formats = data.get("formats") or []
-    extractor_name = str(data.get("extractor_key") or data.get("extractor") or "").lower()
-    webpage_url = str(data.get("webpage_url") or data.get("original_url") or "").lower()
-    prefer_stable_http = "soundcloud" in extractor_name or "soundcloud.com" in webpage_url or "snd.sc" in webpage_url
-    candidates = [fmt for fmt in formats if fmt.get("acodec") not in {None, "none"} and fmt.get("url")]
-    if candidates:
-        return max(candidates, key=lambda fmt: score_audio_format(fmt, prefer_stable_http=prefer_stable_http))
+    ranked_formats = rank_audio_formats(data)
+    if ranked_formats:
+        return ranked_formats[0][1]
     return None
 
 
@@ -2996,7 +3317,7 @@ async def enrich_ytdl_entries(loop, extract, entries, *, cache, ttl_seconds):
         return enriched_entries
 
     results = await asyncio.gather(*(task for _, _, task in pending), return_exceptions=True)
-    for (entry, candidate_url, _), result in zip(pending, results):
+    for (entry, candidate_url, _), result in zip(pending, results, strict=True):
         if isinstance(result, Exception) or not result or result.get("entries"):
             enriched_entries.append(entry)
             continue
@@ -3012,9 +3333,7 @@ async def resolve_text_query_candidates(loop, query_text, *, source="youtube", l
         return []
 
     def extract(candidate):
-        candidate_text = str(candidate or "").strip().lower()
-        extractor = ytdl_search if candidate_text.startswith("ytsearch") else ytdl
-        return extractor.extract_info(candidate, download=False)
+        return extract_info_with_fallbacks(candidate)
 
     entries = await search_ytdl_entries(
         loop,
@@ -3025,7 +3344,7 @@ async def resolve_text_query_candidates(loop, query_text, *, source="youtube", l
 
     if not entries:
         try:
-            direct_result = await loop.run_in_executor(None, lambda: ytdl.extract_info(query_value, download=False))
+            direct_result = await loop.run_in_executor(None, lambda: extract_info_with_fallbacks(query_value, search=False))
         except Exception:
             direct_result = None
 
@@ -3072,18 +3391,39 @@ class YTDLSource(discord.AudioSource):
         self.data = data
         self.title = data.get("title")
         self.volume = volume
+        self._prebuffered_frames = deque()
+        self._prebuffer_complete = False
 
     def read(self):
+        if self._prebuffered_frames:
+            return self._prebuffered_frames.popleft()
         return self.source.read()
 
     def is_opus(self):
         return self.source.is_opus()
 
     def cleanup(self):
-        try:
+        with suppress(Exception):
             self.source.cleanup()
+        self._prebuffered_frames.clear()
+
+    def prebuffer(self, frame_count=AUDIO_PREBUFFER_FRAMES):
+        if self._prebuffer_complete:
+            return len(self._prebuffered_frames)
+
+        try:
+            frame_total = max(0, int(frame_count))
         except Exception:
-            pass
+            frame_total = AUDIO_PREBUFFER_FRAMES
+
+        for _ in range(frame_total):
+            frame = self.source.read()
+            if not frame:
+                break
+            self._prebuffered_frames.append(frame)
+
+        self._prebuffer_complete = True
+        return len(self._prebuffered_frames)
 
     @classmethod
     def from_data(cls, data, *, volume=1.0, start_at=0):
@@ -3116,13 +3456,13 @@ class YTDLSource(discord.AudioSource):
             or bool((selected_format or {}).get("manifest_url"))
         )
         before_options = FFMPEG_STREAM_BEFORE_OPTIONS
-        stream_options = FFMPEG_SOUNDCLOUD_STREAM_OPTIONS if is_soundcloud_stream else FFMPEG_STREAM_OPTIONS
-        if is_soundcloud_stream:
-            before_options = f"{before_options} -fflags +genpts -probesize 512k -analyzeduration 3000000"
+        pcm_stream_options = FFMPEG_SOUNDCLOUD_STREAM_OPTIONS if is_soundcloud_stream else FFMPEG_PCM_STREAM_OPTIONS
         if start_at and start_at > 0:
             before_options = f"{before_options} -ss {int(start_at)}"
 
         use_opus_copy = (
+            ALLOW_OPUS_PASSTHROUGH
+            and
             codec_name == "opus"
             and ext_name in {"webm", "ogg", "opus"}
             and not is_soundcloud_stream
@@ -3135,14 +3475,14 @@ class YTDLSource(discord.AudioSource):
                 executable=find_ffmpeg(),
                 codec="copy",
                 before_options=before_options,
-                options=stream_options,
+                options=FFMPEG_STREAM_OPTIONS,
             )
         else:
             source = discord.FFmpegPCMAudio(
                 audio_url,
                 executable=find_ffmpeg(),
                 before_options=before_options,
-                options=stream_options,
+                options=pcm_stream_options,
             )
         return cls(source, data=playback_data, volume=volume)
 
@@ -3158,12 +3498,10 @@ class YTDLSource(discord.AudioSource):
         expected_duration=None,
         start_at=0,
     ):
-        loop = loop or asyncio.get_event_loop()
+        loop = loop or asyncio.get_running_loop()
 
         def extract(candidate):
-            candidate_text = str(candidate or "").strip().lower()
-            extractor = ytdl_search if candidate_text.startswith("ytsearch") else ytdl
-            return extractor.extract_info(candidate, download=False)
+            return extract_info_with_fallbacks(candidate)
 
         data = None
         resolved_url = url
@@ -3202,7 +3540,7 @@ class YTDLSource(discord.AudioSource):
 
     @classmethod
     async def from_track(cls, track, *, loop=None, volume=1.0, start_at=0):
-        loop = loop or asyncio.get_event_loop()
+        loop = loop or asyncio.get_running_loop()
         expected_title = track.get("title")
         expected_artist = track.get("artist")
         expected_duration = track.get("duration")
@@ -3217,14 +3555,12 @@ class YTDLSource(discord.AudioSource):
             and bool(expected_artist)
             and expected_artist != "Artiste inconnu"
         )
-        primary_search_size = 2 if strict_source else YOUTUBE_PRIMARY_SEARCH_SIZE
-        fallback_search_size = 1 if strict_source else YOUTUBE_FALLBACK_SEARCH_SIZE
-        enrich_limit = 1 if strict_source else MAX_ENRICHED_CANDIDATES
+        primary_search_size = max(3, YOUTUBE_PRIMARY_SEARCH_SIZE) if strict_source else YOUTUBE_PRIMARY_SEARCH_SIZE
+        fallback_search_size = max(2, YOUTUBE_FALLBACK_SEARCH_SIZE) if strict_source else YOUTUBE_FALLBACK_SEARCH_SIZE
+        enrich_limit = 2 if strict_source else MAX_ENRICHED_CANDIDATES
 
         def extract(candidate):
-            candidate_text = str(candidate or "").strip().lower()
-            extractor = ytdl_search if candidate_text.startswith("ytsearch") else ytdl
-            return extractor.extract_info(candidate, download=False)
+            return extract_info_with_fallbacks(candidate)
 
         async def try_candidate_entries(entries, *, minimum_score=None, max_candidates=4, raise_last_error=False):
             last_runtime_error = None
@@ -3325,7 +3661,10 @@ class YTDLSource(discord.AudioSource):
             return None
 
         if isinstance(playback_data, dict) and playback_data:
-            return cls.from_data(playback_data, volume=volume, start_at=start_at)
+            if not playback_data_is_fresh(playback_data):
+                track.pop("_playback_data", None)
+            else:
+                return cls.from_data(playback_data, volume=volume, start_at=start_at)
 
         direct_url_error = None
 
@@ -3513,7 +3852,7 @@ class YTDLSource(discord.AudioSource):
 
         if not merged_entries:
             fallback_searches = []
-            if strict_source and expected_title and expected_artist and expected_artist != "Artiste inconnu":
+            if expected_title and expected_artist and expected_artist != "Artiste inconnu":
                 fallback_searches.extend([
                     f"{expected_artist} {expected_title}",
                     f"{expected_title} {expected_artist}",
@@ -3540,23 +3879,13 @@ class YTDLSource(discord.AudioSource):
 
             raise RuntimeError("Aucun resultat audio fiable n'a ete trouvé")
 
-        scored_entries = sorted(
-            [
-                (
-                    score_youtube_candidate(
-                        entry,
-                        title=expected_title,
-                        artist=expected_artist,
-                        duration=expected_duration,
-                        query_text=query,
-                        source=source_name,
-                    ),
-                    entry,
-                )
-                for entry in merged_entries
-            ],
-            key=lambda item: item[0],
-            reverse=True,
+        scored_entries = rank_entries(
+            merged_entries,
+            title=expected_title,
+            artist=expected_artist,
+            duration=expected_duration,
+            query_text=query,
+            source=source_name,
         )
         ranked_entries = [entry for _, entry in scored_entries]
         top_score = scored_entries[0][0]
@@ -3605,7 +3934,7 @@ class YTDLSource(discord.AudioSource):
         fallback_searches = []
         if query and not looks_like_url(str(query)):
             fallback_searches.append(query)
-        if strict_source and expected_title and expected_artist and expected_artist != "Artiste inconnu":
+        if expected_title and expected_artist and expected_artist != "Artiste inconnu":
             fallback_searches.extend([
                 f"{expected_artist} {expected_title}",
                 f"{expected_title} {expected_artist}",
@@ -3690,6 +4019,13 @@ class MusicPlayer:
     def has_following_track(self):
         return bool(self.queue) or bool(self.loopqueue and self.original_queue)
 
+    def has_pending_background_start(self):
+        return bool(
+            self.playback_transition
+            or (self.play_start_task and not self.play_start_task.done())
+            or (self.voice_recovery_task and not self.voice_recovery_task.done())
+        )
+
     async def wait_for_stable_state(self, *, timeout=1.5, poll_interval=0.05):
         deadline = time.monotonic() + max(0.1, float(timeout))
         while True:
@@ -3771,6 +4107,34 @@ class MusicPlayer:
         self.force_advance_once = False
         return self.queue[0] if self.queue else None
 
+    def clear_current_track(self, *, add_to_history=False):
+        if add_to_history and self.current and not self.skip_history_once:
+            self.history.append(self.current)
+        self.skip_history_once = False
+        self.current = None
+
+    def reset_runtime_state(self, *, clear_history=False):
+        self.navigation_token += 1
+        self.queue.clear()
+        self.original_queue = []
+        self.current = None
+        self.playing = False
+        self.loop = False
+        self.loopqueue = False
+        self.auto_queue_message_enabled = True
+        self.replay_current_on_error = False
+        self.force_advance_once = False
+        self.voice_recovery_attempts = 0
+        self.after_playback_advance_pending = False
+        self.skip_history_once = False
+        self.suppress_next_after = False
+        self.playback_transition = False
+        self.playback_started_at = None
+        self.playback_paused_at = None
+        self.playback_paused_total = 0.0
+        if clear_history:
+            self.history = []
+
     def start_playback_background(self):
         if self.playing:
             return
@@ -3800,29 +4164,13 @@ class MusicPlayer:
 
     async def _advance_after_playback(self):
         try:
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(0.45)
         except asyncio.CancelledError:
             return
 
-        if self.stop_in_progress:
+        if self.stop_in_progress or self.playback_transition:
             return
 
-        for _ in range(20):
-            if self.stop_in_progress:
-                return
-            if not self.playback_transition:
-                break
-            await asyncio.sleep(0.15)
-
-        if self.stop_in_progress:
-            return
-
-        if self.playback_transition:
-            self.schedule_voice_recovery(delay=0.35)
-            return
-
-        if self.has_following_track():
-            self.force_advance_once = True
         self.start_playback_background()
 
     def cancel_playback_watchdog(self):
@@ -3832,6 +4180,16 @@ class MusicPlayer:
         self.playback_started_at = None
         self.playback_paused_at = None
         self.playback_paused_total = 0.0
+
+    async def prepare_audio_source_for_playback(self, player):
+        if not isinstance(player, YTDLSource) or AUDIO_PREBUFFER_FRAMES <= 0:
+            return 0
+
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(None, player.prebuffer, AUDIO_PREBUFFER_FRAMES)
+        except Exception:
+            return 0
 
     def mark_playback_started(self, start_offset=0, *, paused=False):
         now = time.monotonic()
@@ -3918,18 +4276,12 @@ class MusicPlayer:
                         and elapsed_value is not None
                         and elapsed_value >= (float(duration_value) + 8.0)
                     ):
-                        if self.has_following_track():
-                            self.force_advance_once = True
-                            self.replay_current_on_error = False
-                        else:
-                            if self.can_retry_current_track():
-                                self.mark_current_retry()
-                            self.force_advance_once = False
-                            self.replay_current_on_error = True
-                        if voice_client and (voice_client.is_playing() or voice_client.is_paused()) and self.has_following_track():
+                        self.force_advance_once = True
+                        self.replay_current_on_error = False
+                        if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
                             voice_client.stop()
                         else:
-                            self.start_playback_background()
+                            await self.play_next()
                         return
 
                     if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
@@ -3938,15 +4290,9 @@ class MusicPlayer:
 
                     silent_checks += 1
                     if silent_checks >= 2 and self.current is track:
-                        if self.has_following_track():
-                            self.force_advance_once = True
-                            self.replay_current_on_error = False
-                        else:
-                            if self.can_retry_current_track():
-                                self.mark_current_retry()
-                            self.force_advance_once = False
-                            self.replay_current_on_error = True
-                        self.start_playback_background()
+                        self.force_advance_once = True
+                        self.replay_current_on_error = False
+                        await self.play_next()
                         return
             except asyncio.CancelledError:
                 return
@@ -4043,9 +4389,13 @@ class MusicPlayer:
                 return youtube_channel
 
         preferred_artist = clean_spotify_text(data.get("artist"))
-        if preferred_artist and expected_artist and requested_source in {"spotify", "deezer"}:
-            if is_strong_token_match(expected_artist, preferred_artist):
-                return preferred_artist
+        if (
+            preferred_artist
+            and expected_artist
+            and requested_source in {"spotify", "deezer"}
+            and is_strong_token_match(expected_artist, preferred_artist)
+        ):
+            return preferred_artist
 
         candidates = []
         for priority, key in enumerate(("channel", "uploader", "artist", "creator"), start=1):
@@ -4103,6 +4453,36 @@ class MusicPlayer:
             youtube_thumbnail_candidates_from_url(track_url),
             collection.get("thumbnail"),
         ]
+
+    def track_thumbnail_url(self, track):
+        urls = extract_thumbnail_urls(self.track_thumbnail_candidates(track))
+        return urls[0] if urls else None
+
+    def apply_playback_thumbnail(self, track, player_data, collection=None):
+        if not isinstance(track, dict) or not isinstance(player_data, dict):
+            return self.track_thumbnail_url(track)
+
+        playback_thumbnail = player_data.get("thumbnail")
+        collection = collection if isinstance(collection, dict) else None
+        collection_thumbnail = collection.get("thumbnail") if collection else None
+        should_use_playback_thumbnail = (
+            not track.get("thumbnail")
+            or track.get("source") == "youtube"
+            or (
+                collection
+                and collection.get("kind") == "playlist"
+                and collection_thumbnail
+                and track.get("thumbnail") == collection_thumbnail
+            )
+        )
+
+        if playback_thumbnail and should_use_playback_thumbnail:
+            track["thumbnail"] = playback_thumbnail
+
+        thumbnail_url = self.track_thumbnail_url(track)
+        if thumbnail_url:
+            track["thumbnail"] = thumbnail_url
+        return thumbnail_url
 
     def collection_thumbnail_candidates(self, collection, tracks=None):
         if not isinstance(collection, dict):
@@ -4177,7 +4557,7 @@ class MusicPlayer:
     def schedule_message_color_refresh(self, message, *, track=None, collection=None, refresh_all_collection_messages=False):
         return
 
-    def build_queue_embed(self, *, title="📜 File d'attente", embed_color=None):
+    def build_queue_embed(self, *, title=QUEUE_EMBED_TITLE, embed_color=None):
         next_track = self.queue[0] if self.queue else self.current
         if not isinstance(embed_color, int):
             embed_color = self.source_color(next_track.get("source") if next_track else None)
@@ -4196,11 +4576,11 @@ class MusicPlayer:
                     f"`En cours` **{title_value}**\n"
                     f"{artist_value} • {duration_value} • {source_value}"
                 )
-                embed.set_footer(text="0 en attente • 1 en cours • 🎧 Discordbot (music)")
+                embed.set_footer(text="0 en attente • 1 en cours • 🎧 Renaud (music) / DJ Renaud")
                 return embed
 
             embed.description = "📭 La file est vide."
-            embed.set_footer(text="🎧 Discordbot (music)")
+            embed.set_footer(text="🎧 Renaud (music) / DJ Renaud")
             return embed
 
         compact_mode = len(self.queue) >= QUEUE_COMPACT_THRESHOLD
@@ -4244,7 +4624,7 @@ class MusicPlayer:
             footer_parts.insert(0, "1 en cours")
         if known_duration_count:
             footer_parts.append(f"{format_duration(known_duration)} restantes")
-        footer_parts.append("🎧 Discordbot (music)")
+        footer_parts.append("🎧 Renaud (music) / DJ Renaud")
         embed.set_footer(text=" • ".join(footer_parts))
         return embed
 
@@ -4319,7 +4699,7 @@ class MusicPlayer:
         if collection.get("thumbnail"):
             embed.set_image(url=collection["thumbnail"])
 
-        embed.set_footer(text="🎧 Discordbot (music)")
+        embed.set_footer(text="🎧 Renaud (music) / DJ Renaud")
         return [embed]
 
     async def clear_collection_messages(self):
@@ -4329,10 +4709,8 @@ class MusicPlayer:
         messages.extend(self.collection_extra_messages)
 
         for message in messages:
-            try:
+            with suppress(Exception):
                 await message.delete()
-            except Exception:
-                pass
 
         self.collection_message = None
         self.collection_extra_messages = []
@@ -4397,7 +4775,7 @@ class MusicPlayer:
                 )
                 if sent is not None:
                     sent_messages.append(sent)
-            except Exception:
+            except Exception:  # noqa: PERF203
                 continue
 
         self.collection_message = sent_messages[0] if sent_messages else None
@@ -4405,78 +4783,85 @@ class MusicPlayer:
         self.collection_signature_key = current_signature if sent_messages else None
         return bool(sent_messages)
 
-    async def clear_queue_message(self):
+    def is_queue_embed_message(self, message):
+        if message is None or not getattr(message, "embeds", None):
+            return False
+        first_embed = message.embeds[0] if message.embeds else None
+        return str(getattr(first_embed, "title", "") or "").strip() == QUEUE_EMBED_TITLE
+
+    async def clear_queue_message(self, *, purge_channel=False):
         if not self.queue_message:
             self.queue_message_signature = None
+            if purge_channel:
+                await self.purge_queue_messages_in_channel()
             return
-        try:
+        with suppress(Exception):
             await self.queue_message.delete()
-        except Exception:
-            pass
         self.queue_message = None
         self.queue_message_signature = None
+        if purge_channel:
+            await self.purge_queue_messages_in_channel()
 
-    async def purge_queue_messages_in_channel(self, limit=30):
+    async def find_queue_messages(self, limit=30):
         if bot.user is None:
-            return
+            return []
+        messages = []
         try:
             async for message in self.ctx.channel.history(limit=limit):
-                if message.author.id != bot.user.id or not message.embeds:
+                if message.author.id != bot.user.id:
                     continue
-                first_embed = message.embeds[0]
-                if str(first_embed.title or "").strip() == "📜 File d'attente":
-                    try:
-                        await message.delete()
-                    except Exception:
-                        pass
+                if self.is_queue_embed_message(message):
+                    messages.append(message)
         except Exception:
-            return
+            return []
+        return messages
+
+    async def purge_queue_messages_in_channel(self, *, keep_message_id=None, limit=30):
+        for message in await self.find_queue_messages(limit=limit):
+            if keep_message_id and getattr(message, "id", None) == keep_message_id:
+                continue
+            with suppress(Exception):
+                await message.delete()
 
     async def find_existing_queue_message(self):
-        if bot.user is None:
-            return None
-        try:
-            async for message in self.ctx.channel.history(limit=20):
-                if message.author.id != bot.user.id or not message.embeds:
-                    continue
-                first_embed = message.embeds[0]
-                if str(first_embed.title or "").strip() == "📜 File d'attente":
-                    return message
-        except Exception:
-            return None
-        return None
+        messages = await self.find_queue_messages(limit=20)
+        return messages[0] if messages else None
 
     async def sync_queue_message(self, *, move_to_bottom=False, force=False, allow_auto=False):
         # By default queue embed is manual-only (r!queue). allow_auto is used for
         # specific UX cases, like adding a track while another one is already playing.
-        if not force and not allow_auto:
+        if not force and not allow_auto and self.queue_message is None:
             return
 
         async with self.queue_sync_lock:
             if not self.queue and not self.current:
-                await self.clear_queue_message()
+                await self.clear_queue_message(purge_channel=True)
                 return
 
             if self.queue_message and self.queue_message.channel != self.ctx.channel:
                 await self.clear_queue_message()
 
-            if self.queue_message is None:
-                existing_message = await self.find_existing_queue_message()
-                if existing_message and existing_message.channel == self.ctx.channel:
-                    self.queue_message = existing_message
-                    existing_embed = existing_message.embeds[0] if existing_message.embeds else None
-                    self.queue_message_signature = embed_signature(existing_embed, key="queue_message")
+            existing_messages = await self.find_queue_messages(limit=30)
+            if existing_messages:
+                current_message_id = getattr(self.queue_message, "id", None)
+                primary_message = next(
+                    (message for message in existing_messages if getattr(message, "id", None) == current_message_id),
+                    existing_messages[0],
+                )
+                self.queue_message = primary_message
+                existing_embed = primary_message.embeds[0] if primary_message.embeds else None
+                self.queue_message_signature = embed_signature(existing_embed, key="queue_message")
+                await self.purge_queue_messages_in_channel(
+                    keep_message_id=getattr(primary_message, "id", None),
+                    limit=30,
+                )
+            else:
+                self.queue_message = None
+                self.queue_message_signature = None
 
             next_track = self.queue[0] if self.queue else self.current
             color_seed_track = self.current if isinstance(self.current, dict) else next_track
-            if isinstance(color_seed_track, dict):
-                embed_color = (
-                    await self.resolve_track_embed_color(color_seed_track)
-                    if force
-                    else self.immediate_embed_color_for_track(color_seed_track)
-                )
-            else:
-                embed_color = None
+            embed_color = await self.resolve_track_embed_color(color_seed_track) if isinstance(color_seed_track, dict) else None
             embed = self.build_queue_embed(embed_color=embed_color)
             new_signature = embed_signature(embed, key="queue_message")
 
@@ -4491,6 +4876,13 @@ class MusicPlayer:
                 if existing_signature == new_signature:
                     self.queue_message_signature = new_signature
                     return
+                try:
+                    updated_message = await self.queue_message.edit(embed=embed)
+                    self.queue_message = updated_message or self.queue_message
+                    self.queue_message_signature = new_signature
+                    return
+                except Exception:
+                    await self.clear_queue_message()
 
             if self.queue_message:
                 await self.clear_queue_message()
@@ -4498,7 +4890,8 @@ class MusicPlayer:
                 self.queue_message_signature = None
 
             try:
-                self.queue_message = await send_unique_embed(self.ctx, embed, key="queue_message")
+                await self.purge_queue_messages_in_channel(limit=30)
+                self.queue_message = await self.ctx.send(embed=embed)
                 self.queue_message_signature = new_signature if self.queue_message else None
             except Exception:
                 self.queue_message = None
@@ -4508,14 +4901,15 @@ class MusicPlayer:
         if isinstance(item, dict):
             return item
 
+        is_url_item = looks_like_url(item)
         query_text = str(item or "").strip()
         if query_text:
             cached_track = get_cached(queue_item_resolution_cache, query_text)
             if isinstance(cached_track, dict):
                 return dict(cached_track)
-        inferred_source = infer_source_from_input(item) if looks_like_url(item) else "youtube"
+        inferred_source = infer_source_from_input(item) if is_url_item else "youtube"
 
-        if looks_like_url(item) and not self.playing and not self.current and not self.queue:
+        if is_url_item and not self.playing and not self.current and not self.queue:
             if inferred_source in {"youtube", "soundcloud"}:
                 page_metadata = (
                     await resolve_youtube_page_metadata(item)
@@ -4552,12 +4946,13 @@ class MusicPlayer:
             set_cached(queue_item_resolution_cache, query_text, dict(track_data), TRACK_CACHE_TTL_SECONDS)
             return track_data
 
-        if looks_like_url(item):
-            loop = asyncio.get_event_loop()
+        if is_url_item:
+            loop = asyncio.get_running_loop()
             try:
-                data = await loop.run_in_executor(None, lambda: ytdl.extract_info(item, download=False))
-                if "entries" in data and data["entries"]:
-                    data = next((entry for entry in data["entries"] if entry), None) or data["entries"][0]
+                data = await loop.run_in_executor(None, lambda: extract_info_with_fallbacks(item, search=False))
+                entries = data.get("entries") if isinstance(data, dict) else None
+                if entries:
+                    data = next((entry for entry in entries if entry), None) or entries[0]
                 title = data.get("title", item) if data else item
                 thumb = data.get("thumbnail") if data else None
                 uploader = (data.get("channel") or data.get("uploader")) if data else None
@@ -4585,9 +4980,9 @@ class MusicPlayer:
                     if thumbnail_candidates and not thumb:
                         thumb = thumbnail_candidates[0]
         else:
-            title, thumb, uploader, duration, extractor = None, None, None, None, ""
+            title, thumb, uploader, duration, extractor, resolved_url = None, None, None, None, "", None
             if query_text:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 candidates = await resolve_text_query_candidates(
                     loop,
                     query_text,
@@ -4602,6 +4997,9 @@ class MusicPlayer:
                     uploader = first_entry.get("artist") or first_entry.get("channel") or first_entry.get("uploader")
                     duration = first_entry.get("duration")
                     extractor = str(first_entry.get("extractor_key") or first_entry.get("extractor") or "").lower()
+                    resolved_url = first_entry.get("webpage_url") or first_entry.get("original_url")
+                    if not resolved_url and first_entry.get("id") and "youtube" in extractor:
+                        resolved_url = f"https://www.youtube.com/watch?v={first_entry['id']}"
                     if not thumb:
                         thumbnail_candidates = youtube_thumbnail_candidates_from_data(first_entry)
                         if thumbnail_candidates:
@@ -4626,7 +5024,7 @@ class MusicPlayer:
             title = query_text
 
         track_data = {
-            "url": item if looks_like_url(item) else None,
+            "url": item if is_url_item else resolved_url,
             "query": item,
             "title": title,
             "thumbnail": thumb,
@@ -4641,10 +5039,8 @@ class MusicPlayer:
     async def resolve_skip_status(self, content):
         if not self.skip_status_message:
             return
-        try:
+        with suppress(Exception):
             await self.skip_status_message.edit(content=content)
-        except Exception:
-            pass
         self.skip_status_message = None
 
     def handle_playback_after(self, error):
@@ -4669,9 +5065,6 @@ class MusicPlayer:
 
         near_track_end = self.is_track_near_end(current_track, elapsed_seconds=elapsed_seconds, tail_seconds=12.0, fraction=0.75)
         has_following_track = self.has_following_track()
-        if has_following_track:
-            self.force_advance_once = True
-            self.replay_current_on_error = False
         should_retry_current = (
             error is not None
             and current_track
@@ -4697,6 +5090,21 @@ class MusicPlayer:
         voice_client = self.get_voice_client()
         if voice_client is None:
             raise RuntimeError("Le bot n'est pas connecté à un salon vocal.")
+
+        ready_voice_client = await wait_for_voice_client(
+            self.ctx.guild,
+            timeout=VOICE_AUDIO_READY_WAIT_SECONDS,
+            poll_interval=VOICE_AUDIO_READY_POLL_SECONDS,
+            require_audio_ready=True,
+        )
+        if ready_voice_client is None:
+            dave_protocol_version, can_encrypt = voice_dave_status(voice_client)
+            if dave_protocol_version > 0 and not can_encrypt:
+                raise RuntimeError(
+                    "Session vocale DAVE non prête. Discord accepte la connexion, mais l'audio n'est pas encore chiffrable de façon audible."
+                )
+        else:
+            voice_client = ready_voice_client
 
         track = self.current
         if not track:
@@ -4726,6 +5134,7 @@ class MusicPlayer:
             track["thumbnail"] = player.data.get("thumbnail")
         track["_playback_data"] = dict(player.data)
         track["_seek_position"] = int(seconds)
+        await self.prepare_audio_source_for_playback(player)
         self.playing = True
         self.cancel_idle_disconnect()
 
@@ -4739,7 +5148,7 @@ class MusicPlayer:
             voice_client.play(player, after=self.handle_playback_after)
         except Exception as exc:
             self.suppress_next_after = False
-            raise RuntimeError(f"Impossible de lancer la lecture : {exc}")
+            raise RuntimeError(f"Impossible de lancer la lecture : {exc}") from exc
 
         self.mark_playback_started(start_offset=seconds, paused=was_paused)
         if was_paused:
@@ -4756,27 +5165,15 @@ class MusicPlayer:
         self.cancel_idle_disconnect()
         self.idle_disconnect_task = asyncio.create_task(self._idle_disconnect_worker())
 
-    def schedule_voice_recovery(self, delay=1.2):
+    def schedule_voice_recovery(self, delay=VOICE_RECOVERY_DELAY_SECONDS):
         if self.voice_recovery_task and not self.voice_recovery_task.done():
             return
 
         async def _recover():
             try:
                 await asyncio.sleep(delay)
-                for _ in range(20):
-                    if self.stop_in_progress:
-                        return
-                    if not self.playback_transition:
-                        break
-                    await asyncio.sleep(0.15)
-
-                if self.stop_in_progress:
-                    return
-
-                if not self.playback_transition and not self.playing:
-                    if self.has_following_track():
-                        self.force_advance_once = True
-                    self.start_playback_background()
+                if not self.playback_transition:
+                    await self.play_next()
             except asyncio.CancelledError:
                 return
             finally:
@@ -4804,12 +5201,7 @@ class MusicPlayer:
 
         self.forget_collection_messages()
         players.pop(self.ctx.guild.id, None)
-        await bot.change_presence(
-            activity=discord.Activity(
-                type=discord.ActivityType.listening,
-                name=f"{PREFIX}help",
-            )
-        )
+        await set_idle_presence_if_inactive()
         await self.ctx.send("⏹️ Déconnexion automatique après 3 minutes d'inactivité.")
 
     async def play_next(self):
@@ -4834,8 +5226,8 @@ class MusicPlayer:
                     self.mark_current_retry()
                     self.replay_current_on_error = True
                     self.voice_recovery_attempts += 1
-                    if self.voice_recovery_attempts <= 10:
-                        self.schedule_voice_recovery(delay=1.2)
+                    if self.voice_recovery_attempts <= VOICE_RECOVERY_MAX_ATTEMPTS:
+                        self.schedule_voice_recovery(delay=VOICE_RECOVERY_DELAY_SECONDS)
                         return
                 self.replay_current_on_error = False
                 self.voice_recovery_attempts = 0
@@ -4869,8 +5261,10 @@ class MusicPlayer:
                     if self.loopqueue and self.original_queue:
                         self.queue = self.original_queue.copy()
                     else:
+                        self.clear_current_track(add_to_history=True)
                         self.playing = False
                         self.schedule_idle_disconnect()
+                        await set_idle_presence_if_inactive(ignore_player=self)
                         await self.sync_queue_message()
                         await self.resolve_skip_status("**⚠️ Plus aucune musique dans la file.**")
                         return
@@ -4893,6 +5287,9 @@ class MusicPlayer:
                     f"**❌ Impossible de lire : {exc}**",
                     key=f"play_next_load_error:{track.get('title') or track.get('url') or 'unknown'}",
                 )
+                if self.current is track:
+                    self.clear_current_track(add_to_history=False)
+                self.replay_current_on_error = False
                 self.playing = False
                 await self.resolve_skip_status("**❌ Impossible de charger la musique suivante.**")
                 self.playback_transition = False
@@ -4900,10 +5297,8 @@ class MusicPlayer:
                 return
 
             if transition_token != self.navigation_token or self.current is not track:
-                try:
+                with suppress(Exception):
                     player.cleanup()
-                except Exception:
-                    pass
                 restart_needed = True
             if restart_needed:
                 self.playing = False
@@ -4915,19 +5310,9 @@ class MusicPlayer:
                 if not track.get("duration"):
                     track["duration"] = player.data.get("duration")
                 collection = track.get("_collection") if isinstance(track.get("_collection"), dict) else None
-                collection_thumbnail = collection.get("thumbnail") if collection else None
-                if not track.get("thumbnail"):
-                    track["thumbnail"] = player.data.get("thumbnail")
-                elif (
-                    collection
-                    and collection.get("kind") == "playlist"
-                    and collection_thumbnail
-                    and track.get("thumbnail") == collection_thumbnail
-                    and player.data.get("thumbnail")
-                ):
-                    track["thumbnail"] = player.data.get("thumbnail")
                 track["_playback_data"] = dict(player.data)
                 track["_seek_position"] = 0
+                now_playing_thumbnail = self.apply_playback_thumbnail(track, player.data, collection=collection)
 
                 actual_source_key = self.playback_source_key(player.data, fallback=track.get("source"))
                 actual_source_name = self.playback_source_name(
@@ -4953,6 +5338,35 @@ class MusicPlayer:
                     self.playing = False
                     await send_unique_feedback(self.ctx, "**❌ Le salon vocal n'est plus disponible.**", key="voice_unavailable")
                     return
+
+                audio_ready_client = await wait_for_voice_client(
+                    self.ctx.guild,
+                    timeout=VOICE_AUDIO_READY_WAIT_SECONDS,
+                    poll_interval=VOICE_AUDIO_READY_POLL_SECONDS,
+                    require_audio_ready=True,
+                )
+                if audio_ready_client is None:
+                    dave_protocol_version, can_encrypt = voice_dave_status(voice_client)
+                    self.playing = False
+                    if dave_protocol_version > 0 and not can_encrypt:
+                        await send_unique_feedback(
+                            self.ctx,
+                            "**❌ Session vocale DAVE non prête. Discord affiche le bot comme connecté, mais l'audio n'est pas encore chiffrable de façon audible. Réessaie dans quelques secondes.**",
+                            key="voice_dave_not_ready",
+                        )
+                        self.playback_transition = False
+                        self.schedule_voice_recovery(delay=0.75)
+                        return
+                    await send_unique_feedback(
+                        self.ctx,
+                        "**❌ Le transport vocal n'est pas encore prêt. Réessaie dans quelques secondes.**",
+                        key="voice_transport_not_ready",
+                    )
+                    self.playback_transition = False
+                    self.schedule_voice_recovery(delay=0.75)
+                    return
+                voice_client = audio_ready_client
+                await self.prepare_audio_source_for_playback(player)
 
                 if after_playback_advance or force_advance:
                     is_idle = await self.wait_for_voice_idle(voice_client, timeout=1.25, poll_interval=0.05)
@@ -5048,17 +5462,12 @@ class MusicPlayer:
                     f"Durée: {format_duration(track.get('duration'))} • "
                     f"Source: {source_value}"
                 )
-                if track.get("thumbnail"):
-                    embed.set_image(url=track["thumbnail"])
+                if now_playing_thumbnail:
+                    embed.set_image(url=now_playing_thumbnail)
                 embed.set_footer(text=details_line)
                 await send_unique_embed(self.ctx, embed, key="now_playing")
 
-                await bot.change_presence(
-                    activity=discord.Activity(
-                        type=discord.ActivityType.listening,
-                        name=f"{display_artist} - {track.get('title', 'Titre inconnu')}",
-                    )
-                )
+                await set_track_presence(display_artist, track.get("title", "Titre inconnu"))
                 await self.sync_queue_message()
         finally:
             self.playback_transition = False
@@ -5099,10 +5508,12 @@ class MusicPlayer:
 
         has_live_voice_playback = self.has_live_voice_activity(voice_client)
         should_start_playback = (
+            bool(self.queue)
+            and
             not has_live_voice_playback
             and not self.playing
             and not self.playback_transition
-            and not self.current
+            and not self.has_pending_background_start()
         )
         if should_start_playback:
             self.start_playback_background()
@@ -5115,6 +5526,43 @@ class MusicPlayer:
 
 
 players = {}
+
+
+def build_listening_activity(name):
+    return discord.Activity(type=discord.ActivityType.listening, name=name)
+
+
+def has_active_music_player(*, ignore_player=None):
+    for player in list(players.values()):
+        if player is ignore_player:
+            continue
+        try:
+            voice_client = player.get_voice_client()
+            if (
+                player.playing
+                or player.playback_transition
+                or player.has_live_voice_activity(voice_client)
+                or (player.play_start_task and not player.play_start_task.done())
+                or (player.voice_recovery_task and not player.voice_recovery_task.done())
+            ):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def set_idle_presence_if_inactive(*, force=False, ignore_player=None):
+    if not force and has_active_music_player(ignore_player=ignore_player):
+        return
+    with suppress(Exception):
+        await bot.change_presence(activity=build_listening_activity(IDLE_LISTENING_STATUS))
+
+
+async def set_track_presence(display_artist, title):
+    artist_text = clean_spotify_text(display_artist) or "Artiste inconnu"
+    title_text = clean_spotify_text(title) or "Titre inconnu"
+    with suppress(Exception):
+        await bot.change_presence(activity=build_listening_activity(f"{artist_text} - {title_text}"))
 
 
 def get_player(ctx):
@@ -5138,36 +5586,37 @@ async def play(ctx, *, url: str = ""):
     if ctx.author.voice is None:
         return await ctx.send("**⚠️ Tu dois être dans un salon vocal !**")
 
+    if not DAVE_LOADED:
+        await send_unique_feedback(
+            ctx,
+            "**❌ Voice Discord requiert DAVE/E2EE. Installe `davey` dans l'environnement du bot puis redémarre.**",
+            key=command_feedback_key(ctx, "play_missing_dave"),
+        )
+        return
+
     player = get_player(ctx)
     channel = ctx.author.voice.channel
     guild_vc = ctx.guild.voice_client
     has_active_playback = player.has_pending_playback(guild_vc)
 
     if guild_vc is None:
-        if has_active_playback:
-            # During transient reconnect states, keep queueing instead of forcing
-            # a fresh voice connect that can interrupt current playback.
-            pass
-        else:
-            connect_error = None
-            for _ in range(2):
-                try:
-                    await channel.connect(timeout=20, reconnect=True)
-                    connect_error = None
-                    break
-                except Exception as exc:
-                    connect_error = exc
-                    stale_vc = ctx.guild.voice_client
-                    if stale_vc:
-                        try:
-                            await stale_vc.disconnect()
-                        except Exception:
-                            pass
-                    await asyncio.sleep(0.8)
+        connect_error = None
+        for _ in range(VOICE_CONNECT_RETRIES):
+            try:
+                await channel.connect(timeout=VOICE_CONNECT_TIMEOUT_SECONDS, reconnect=True, self_deaf=False)
+                connect_error = None
+                break
+            except Exception as exc:
+                connect_error = exc
+                stale_vc = ctx.guild.voice_client
+                if stale_vc:
+                    with suppress(Exception):
+                        await stale_vc.disconnect()
+                await asyncio.sleep(VOICE_CONNECT_RETRY_DELAY_SECONDS)
 
-            if connect_error and not (ctx.guild.voice_client and ctx.guild.voice_client.is_connected()):
-                await send_unique_feedback(ctx, "**❌ Connexion vocale impossible (timeout). Réessaie dans quelques secondes.**", key=command_feedback_key(ctx, "play_connect_timeout"))
-                return
+        if connect_error and not (ctx.guild.voice_client and ctx.guild.voice_client.is_connected()):
+            await send_unique_feedback(ctx, "**❌ Connexion vocale impossible (timeout). Réessaie dans quelques secondes.**", key=command_feedback_key(ctx, "play_connect_timeout"))
+            return
     else:
         if guild_vc.channel and guild_vc.channel != channel and guild_vc.is_connected():
             try:
@@ -5176,22 +5625,34 @@ async def play(ctx, *, url: str = ""):
                 await send_unique_feedback(ctx, "**❌ Impossible de rejoindre ce salon vocal. Réessaie dans quelques secondes.**", key=command_feedback_key(ctx, "play_move_fail"))
                 return
         elif not guild_vc.is_connected():
-            if not has_active_playback:
-                # Give Discord's internal reconnect loop a short chance before forcing a reconnect.
-                existing_ready = await wait_for_voice_client(ctx.guild, timeout=2.0, poll_interval=0.2)
-                if existing_ready is None:
-                    try:
-                        await guild_vc.disconnect()
-                    except Exception:
-                        pass
-                    try:
-                        await channel.connect(timeout=20, reconnect=True)
-                    except Exception:
-                        await send_unique_feedback(ctx, "**❌ Connexion vocale impossible (timeout). Réessaie dans quelques secondes.**", key=command_feedback_key(ctx, "play_reconnect_timeout"))
-                        return
+            # Give Discord's internal reconnect loop a short chance before forcing a reconnect.
+            existing_ready = await wait_for_voice_client(ctx.guild, timeout=VOICE_RECONNECT_GRACE_SECONDS, poll_interval=VOICE_READY_POLL_SECONDS)
+            if existing_ready is None:
+                with suppress(Exception):
+                    await guild_vc.disconnect()
+                try:
+                    await channel.connect(timeout=VOICE_CONNECT_TIMEOUT_SECONDS, reconnect=True, self_deaf=False)
+                except Exception:
+                    await send_unique_feedback(ctx, "**❌ Connexion vocale impossible (timeout). Réessaie dans quelques secondes.**", key=command_feedback_key(ctx, "play_reconnect_timeout"))
+                    return
 
-    voice_client = await wait_for_voice_client(ctx.guild, timeout=2.5 if has_active_playback else VOICE_READY_WAIT_SECONDS)
+    voice_client = await wait_for_voice_client(
+        ctx.guild,
+        timeout=(3.5 if has_active_playback else VOICE_AUDIO_READY_WAIT_SECONDS),
+        poll_interval=VOICE_AUDIO_READY_POLL_SECONDS,
+        require_audio_ready=not has_active_playback,
+    )
     if voice_client is None and not has_active_playback:
+        current_voice_client = ctx.guild.voice_client
+        if current_voice_client and current_voice_client.is_connected():
+            dave_protocol_version, can_encrypt = voice_dave_status(current_voice_client)
+            if dave_protocol_version > 0 and not can_encrypt:
+                await send_unique_feedback(
+                    ctx,
+                    "**❌ Session vocale DAVE non prête. Discord accepte la connexion, mais l'audio n'est pas encore chiffrable de façon audible. Réessaie dans quelques secondes.**",
+                    key=command_feedback_key(ctx, "play_voice_dave_not_ready"),
+                )
+                return
         await send_unique_feedback(ctx, "**❌ La connexion vocale n'est pas encore prête. Réessaie dans un instant.**", key=command_feedback_key(ctx, "play_voice_not_ready"))
         return
 
@@ -5359,21 +5820,9 @@ async def stop(ctx):
                 player.play_start_task.cancel()
             if player.voice_recovery_task and not player.voice_recovery_task.done():
                 player.voice_recovery_task.cancel()
-            player.navigation_token += 1
+            player.reset_runtime_state(clear_history=True)
 
-            player.queue.clear()
-            player.original_queue = []
-            player.loop = False
-            player.loopqueue = False
-            player.current = None
-            player.playing = False
-            player.auto_queue_message_enabled = True
-            player.replay_current_on_error = False
-            player.force_advance_once = False
-            player.voice_recovery_attempts = 0
-            player.after_playback_advance_pending = False
-
-            await player.clear_queue_message()
+            await player.clear_queue_message(purge_channel=True)
             await player.clear_collection_messages()
 
             if has_voice_activity:
@@ -5385,6 +5834,7 @@ async def stop(ctx):
                 player.suppress_next_after = False
 
             player.schedule_idle_disconnect()
+            await set_idle_presence_if_inactive()
             await send_unique_feedback(ctx, "⏹️ Lecture stoppée et file vidée !", key=command_feedback_key(ctx, "stop_done"))
         finally:
             player.stop_in_progress = False
@@ -5426,6 +5876,17 @@ async def seek(ctx, *, timecode: str):
     await ctx.send(f"⏩ Position : **{format_timecode(new_position)}**")
 
 
+@bot.command(help="⏱️ Affiche le timecode de la musique actuelle")
+async def t(ctx):
+    player = get_player(ctx)
+    timecode = format_current_timecode(player)
+    if not timecode:
+        return await ctx.send("⚠️ Aucune musique en cours.")
+
+    title = player.current.get("title") or "Titre inconnu"
+    await ctx.send(f"⏱️ **{title}** : `{timecode}`")
+
+
 @bot.command(help="📜 Affiche la file d'attente")
 async def queue(ctx):
     player = get_player(ctx)
@@ -5433,6 +5894,7 @@ async def queue(ctx):
         return await ctx.send("📭 La file est vide.")
     collection_tracks = player.active_collection_tracks()
     if collection_tracks:
+        await player.clear_queue_message(purge_channel=True)
         await player.sync_collection_message(collection_tracks)
         return
     player.auto_queue_message_enabled = True
@@ -5448,7 +5910,8 @@ async def clear(ctx):
         player.original_queue = []
     if ctx.voice_client and not ctx.voice_client.is_playing():
         player.schedule_idle_disconnect()
-    await player.clear_queue_message()
+        await set_idle_presence_if_inactive()
+    await player.clear_queue_message(purge_channel=True)
     await player.clear_collection_messages()
     await ctx.send("🗑️ File vidée !")
 
@@ -5468,17 +5931,9 @@ async def leave(ctx):
                 player.play_start_task.cancel()
             if player.voice_recovery_task and not player.voice_recovery_task.done():
                 player.voice_recovery_task.cancel()
-            player.queue.clear()
-            player.original_queue = []
-            player.current = None
-            player.playing = False
-            player.replay_current_on_error = False
-            player.force_advance_once = False
-            player.voice_recovery_attempts = 0
-            player.after_playback_advance_pending = False
-            player.auto_queue_message_enabled = True
-            await player.clear_queue_message()
-            player.forget_collection_messages()
+            player.reset_runtime_state(clear_history=True)
+            await player.clear_queue_message(purge_channel=True)
+            await player.clear_collection_messages()
             players.pop(ctx.guild.id, None)
 
             if voice_client and voice_client.is_connected():
@@ -5486,12 +5941,14 @@ async def leave(ctx):
                 await send_unique_feedback(ctx, "⏹️ Déconnecté.", key=command_feedback_key(ctx, "leave_done"))
             else:
                 await send_unique_feedback(ctx, "⏹️ Déconnecté.", key=command_feedback_key(ctx, "leave_done"))
+            await set_idle_presence_if_inactive()
         return
 
     voice_client = ctx.guild.voice_client or ctx.voice_client
     players.pop(ctx.guild.id, None)
     if voice_client and voice_client.is_connected():
         await voice_client.disconnect()
+    await set_idle_presence_if_inactive()
     await send_unique_feedback(ctx, "⏹️ Déconnecté.", key=command_feedback_key(ctx, "leave_done"))
 
 
@@ -5571,34 +6028,150 @@ async def help(ctx):
         ("`pause`", "⏸️ Met la musique en pause"),
         ("`resume`", "▶️ Reprend la musique en pause"),
         ("`seek`", "⏩ Va à un timecode dans la musique en cours"),
+        ("`t`", "⏱️ Affiche le timecode de la musique actuelle"),
         ("`queue`", "📜 Affiche la file d'attente"),
         ("`shuffle`", "🔀 Mélange la file d'attente"),
         ("`loop`", "🔂 Active/Désactive la boucle de la musique actuelle"),
         ("`loop_queue`", "🔁 Active/Désactive la boucle de la file d'attente"),
         ("`leave`", "⏹️ Stoppe la musique et déconnecte le bot"),
-        ("`help`", "❓ Affiche toutes les commandes disponibles"),
     ]
 
     for name, description in ordered_commands:
         embed.add_field(name=f"{PREFIX}{name}", value=description, inline=False)
 
-    embed.set_footer(text="🎧 Discordbot (music)")
+    embed.set_footer(text="🎧 Renaud (music) / DJ Renaud")
     await ctx.send(embed=embed)
 
 
 @bot.event
-async def on_ready():
-    await bot.change_presence(
-        activity=discord.Activity(
-            type=discord.ActivityType.listening,
-            name=f"{PREFIX}help",
-        )
+async def on_command_error(ctx, error):
+    command = getattr(ctx, "command", None)
+    if command:
+        try:
+            if command.has_error_handler():
+                return
+        except Exception:
+            pass
+
+    cog = getattr(ctx, "cog", None)
+    if cog:
+        try:
+            if cog.has_error_handler():
+                return
+        except Exception:
+            pass
+
+    if isinstance(error, commands.CommandNotFound):
+        return
+
+    command_name = getattr(command, "qualified_name", "unknown")
+    usage = command_usage(command)
+
+    if isinstance(error, commands.NoPrivateMessage):
+        await send_unique_feedback(ctx, "⚠️ Ce bot fonctionne uniquement dans un serveur Discord.", key="command_no_private_message")
+        return
+
+    if isinstance(error, commands.MissingRequiredArgument):
+        message = "⚠️ Argument manquant."
+        if usage:
+            message = f"{message} Utilise {usage}."
+        await send_unique_feedback(ctx, message, key=f"command_missing_argument:{command_name}")
+        return
+
+    if isinstance(error, (commands.BadArgument, commands.BadUnionArgument)):
+        message = "⚠️ Argument invalide."
+        if usage:
+            message = f"{message} Utilise {usage}."
+        await send_unique_feedback(ctx, message, key=f"command_bad_argument:{command_name}")
+        return
+
+    if isinstance(error, commands.UserInputError):
+        message = "⚠️ Commande invalide."
+        if usage:
+            message = f"{message} Utilise {usage}."
+        await send_unique_feedback(ctx, message, key=f"command_user_input:{command_name}")
+        return
+
+    if isinstance(error, commands.CheckFailure):
+        return
+
+    original = error.original if isinstance(error, commands.CommandInvokeError) else error
+    if isinstance(original, RuntimeError) and str(original).strip():
+        await send_unique_feedback(ctx, f"⚠️ {original}", key=f"command_runtime_error:{command_name}")
+        return
+
+    exc_info = (
+        (type(original), original, original.__traceback__)
+        if isinstance(original, BaseException)
+        else False
     )
+    logging.error(
+        "Erreur de commande non gérée (%s): %s",
+        command_name,
+        original,
+        exc_info=exc_info,
+    )
+    await send_unique_feedback(
+        ctx,
+        "❌ Une erreur inattendue s'est produite. Réessaie dans quelques secondes.",
+        key=f"command_unexpected_error:{command_name}",
+    )
+
+
+@bot.event
+async def on_ready():
+    await set_idle_presence_if_inactive(force=True)
     host_label = _instance_name or "unknown-host"
+    ffmpeg_path = find_ffmpeg()
     print(f"\n✅ Connecté en tant que {bot.user} ({host_label}:{os.getpid()})\n")
+    print(
+        f"OS: {'SteamDeck/Linux' if IS_STEAMDECK else ('Linux' if IS_LINUX else 'Windows')} | "
+        f"FFmpeg: {ffmpeg_path} | Opus: {'OK' if OPUS_LOADED else 'MISSING'} | "
+        f"DAVE: {'OK' if DAVE_LOADED else 'MISSING'} | "
+        f"Opus passthrough: {'ON' if ALLOW_OPUS_PASSTHROUGH else 'OFF'}"
+    )
+    if not OPUS_LOADED:
+        if IS_WINDOWS:
+            print("⚠️ libopus n'a pas été chargée. Sous Windows, vérifie la DLL Discord dans Lib\\site-packages\\discord\\bin\\libopus-0.x64.dll ou place opus.dll dans le PATH.")
+        else:
+            print("⚠️ libopus n'a pas été chargée. Sur Linux/SteamDeck, installe ou rends disponible libopus.so.0 pour fiabiliser la voix Discord.")
+    elif OPUS_LIBRARY_PATH:
+        print(f"Opus chargé depuis: {OPUS_LIBRARY_PATH}")
+    if not DAVE_LOADED:
+        print("⚠️ davey n'est pas chargé. Discord refusera le vocal avec le code 4017 tant que le paquet Python 'davey' n'est pas installé dans cet environnement.")
 
 
-instance_lock_handle = acquire_instance_lock()
-bot.run(TOKEN)
+def require_bot_token():
+    token = str(os.getenv("TOKEN") or TOKEN or "").strip()
+    if token:
+        return token
+    raise RuntimeError("❌ Aucun TOKEN trouvé dans .env !")
+
+
+def main():
+    global instance_lock_handle
+
+    token = require_bot_token()
+    if HAS_DISCORD_PACKAGE_CONFLICT:
+        print(
+            "⚠️ discord.py et py-cord sont installés dans le même interpretateur Python. "
+            "Ces deux paquets partagent le module 'discord' et peuvent provoquer des comportements incoherents."
+            "Utilise un environnement virtuel dédié au bot et évite d'y mélanger py-cord."
+        )
+        print(
+            "   Versions détectées: "
+            f"discord.py={DISCORD_PACKAGE_VERSIONS.get('discord.py')} | "
+            f"py-cord={DISCORD_PACKAGE_VERSIONS.get('py-cord')}"
+        )
+    instance_lock_handle = acquire_instance_lock()
+    try:
+        bot.run(token)
+    finally:
+        release_instance_lock(instance_lock_handle)
+        instance_lock_handle = None
+
+
+if __name__ == "__main__":
+    main()
 
 
