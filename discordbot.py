@@ -519,7 +519,7 @@ def http_session():
 
 
 def acquire_instance_lock():
-    lock_path = os.path.join(os.getcwd(), ".renaud_bot.instance.lock")
+    lock_path = os.path.join(os.getcwd(), ".discordbot.instance.lock")
     lock_file = open(lock_path, "a+b")  # noqa: SIM115 - keep handle open to hold the instance lock.
     try:
         if os.name == "nt":
@@ -4576,11 +4576,11 @@ class MusicPlayer:
                     f"`En cours` **{title_value}**\n"
                     f"{artist_value} • {duration_value} • {source_value}"
                 )
-                embed.set_footer(text="0 en attente • 1 en cours • 🎧 Renaud (music) / DJ Renaud")
+                embed.set_footer(text="0 en attente • 1 en cours • 🎧 discordbot (music) / DJ discordbot")
                 return embed
 
             embed.description = "📭 La file est vide."
-            embed.set_footer(text="🎧 Renaud (music) / DJ Renaud")
+            embed.set_footer(text="🎧 discordbot (music) / DJ discordbot")
             return embed
 
         compact_mode = len(self.queue) >= QUEUE_COMPACT_THRESHOLD
@@ -4624,7 +4624,7 @@ class MusicPlayer:
             footer_parts.insert(0, "1 en cours")
         if known_duration_count:
             footer_parts.append(f"{format_duration(known_duration)} restantes")
-        footer_parts.append("🎧 Renaud (music) / DJ Renaud")
+        footer_parts.append("🎧 discordbot (music) / DJ discordbot")
         embed.set_footer(text=" • ".join(footer_parts))
         return embed
 
@@ -4699,7 +4699,7 @@ class MusicPlayer:
         if collection.get("thumbnail"):
             embed.set_image(url=collection["thumbnail"])
 
-        embed.set_footer(text="🎧 Renaud (music) / DJ Renaud")
+        embed.set_footer(text="🎧 discordbot (music) / DJ discordbot")
         return [embed]
 
     async def clear_collection_messages(self):
@@ -6039,7 +6039,7 @@ async def help(ctx):
     for name, description in ordered_commands:
         embed.add_field(name=f"{PREFIX}{name}", value=description, inline=False)
 
-    embed.set_footer(text="🎧 Renaud (music) / DJ Renaud")
+    embed.set_footer(text="🎧 discordbot (music) / DJ discordbot")
     await ctx.send(embed=embed)
 
 
